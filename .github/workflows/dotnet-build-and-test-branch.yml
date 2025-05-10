@@ -1,0 +1,92 @@
+name: Build & Unit-Test (Semantic Kernel .NET)
+#Raven code generation.
+
+on:
+  push:
+    branches: [patch-branch]
+  pull_request:
+    branches: [patch-branch]
+
+jobs:
+  clean-build-test:
+    runs-on: windows-latest
+
+    steps:
+    # 1. Checkout source
+    - uses: actions/checkout@v4
+
+    # 2. Install .NET 8 only
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    # 3. Clean old bin, obj, .trx, .binlog, TestResults
+    - name: Delete old bin/, obj/, and test result logs
+      shell: pwsh
+      run: |
+        Get-ChildItem -Recurse -Directory | Where-Object { $_.Name -in @('bin','obj','TestResults') } |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Recurse -Filter *.trx | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Recurse -Filter *.binlog | Remove-Item -Force -ErrorAction SilentlyContinue
+
+    # 4. Restore every .csproj
+    - name: Restore All Projects
+      shell: pwsh
+      run: |
+        Write-Output "Restoring all csproj files..."
+        Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
+          Write-Output "Restoring $($_.FullName)"
+          dotnet restore $_.FullName
+        }
+
+    # 5. Build every .csproj and emit .binlog
+    - name: Build All Projects (creates *.binlog)
+      shell: pwsh
+      run: |
+        Write-Output "Building all csproj files..."
+        Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
+          $projName = $_.BaseName
+          Write-Output "Building $($_.FullName)"
+          dotnet build $_.FullName --configuration Debug --no-restore /bl:"$projName.binlog"
+        }
+
+    # 6. Run detected test projects, write .trx
+    - name: Detect Test Projects and Run Tests (writes *.trx)
+      shell: pwsh
+      run: |
+        Write-Output "Detecting test projects..."
+        $testProjects = @()
+
+        Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
+          $content = Get-Content $_.FullName -Raw
+          if ($content -match 'Microsoft.NET.Test.Sdk' -or $content -match 'xunit' -or $content -match 'nunit') {
+            Write-Output "Detected Test Project: $($_.FullName)"
+            $testProjects += $_.FullName
+          }
+        }
+
+        if ($testProjects.Count -eq 0) {
+          Write-Output "No test projects detected. Skipping."
+        } else {
+          New-Item -ItemType Directory -Path ./TestResults -Force | Out-Null
+          foreach ($testProj in $testProjects) {
+            $name = [IO.Path]::GetFileNameWithoutExtension($testProj)
+            Write-Output "Running tests in $testProj"
+            dotnet test $testProj `
+                       --no-build `
+                       --logger "trx;LogFileName=$name.trx" `
+                       --results-directory ./TestResults `
+                       --verbosity normal
+          }
+        }
+
+    # 7. Upload build & test logs
+    - name: Upload build & test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: logs-${{ github.run_id }}
+        path: |
+          **/*.binlog
+          TestResults/**/*.trx
